@@ -1,0 +1,285 @@
+---
+title: "Data Preparation for AMR in SSI Systematic Review"
+author: "Emmanuel Korir"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+# install-if-missing helper
+install_if_missing <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  }
+}
+
+# ensure rprojroot is available
+install_if_missing(c("rprojroot"))
+
+# load libraries (safe)
+library(rprojroot)
+
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# try to find RStudio project root; if not found, fall back to current working dir
+root_dir <- tryCatch(
+  rprojroot::find_rstudio_project_file(),
+  error = function(e) {
+    message("rprojroot couldn't find an RStudio project file; using current working directory.")
+    NULL
+  }
+)
+
+if (!is.null(root_dir)) {
+  knitr::opts_knit$set(root.dir = root_dir)
+} else {
+  # optionally set to getwd() explicitly
+  knitr::opts_knit$set(root.dir = getwd())
+}
+```
+
+## 1. Introduction
+
+This document outlines the initial data loading, cleaning, and preparation steps for the systematic review on Antimicrobial Resistance (AMR) in Surgical Site Infections (SSIs). The goal is to import the extracted data from the CSV file, clean the column names, and create new, properly formatted numeric columns that can be used for quantitative analysis and meta-analysis.
+
+## 2. Loading Libraries and Data
+
+First, we load the necessary R packages. We will use `tidyverse` for general data manipulation and `janitor` for cleaning column names, which makes them much easier to work with in R.
+
+```{r}
+# Function to install missing packages
+
+install_if_missing <- function (packages) {
+    for (pkg in packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+  }
+}
+
+# List of packages you want
+packages <- c("tidyverse", "janitor")
+
+# Install if missing
+install_if_missing(packages)
+
+# Load libraries
+library(tidyverse)
+library(janitor)
+library(stringr)
+```
+
+
+Next, we load the data set from the CSV file. We then use `janitor::clean_names()` to convert the column headers into a standardized, machine-readable format (e.g., lowercase with underscores instead of spaces).
+
+```{r load-data}
+# Load the data set
+df_raw <- read_csv("../data/raw_data/data_extraction_amr_ssi_ecsa.csv")
+
+# Clean column names for easier use
+df_clean <- df_raw %>%
+  clean_names()
+
+# Let's inspect the first few rows and the structure of the cleaned data
+glimpse(df_clean)
+```
+
+## 3. Feature Engineering
+
+Now we will create the new columns as requested: a `first_author` column and several numeric columns derived from the original character-based columns. This process is crucial for making the data "analysis-ready".
+
+### 3.1. Creating a `first_author` column
+
+We'll extract the first author's name from the `author` column. The names are typically separated by commas, so we can extract the text before the first comma. We also clean up any potential leading characters like quotes or brackets.
+
+```{r create-author-column}
+df_processed <- df_clean %>%
+  mutate(
+    # Use str_extract to get all text before the first comma
+    first_author = str_extract(author, "^[^,]+"),
+    # Clean up any stray characters like quotes or brackets that might be left
+    first_author = str_remove_all(first_author, "[\"'\\[\\]]"),
+    # Trim leading/trailing white space
+    first_author = str_trim(first_author),
+    .after = author # Places the new column right after the original 'author' column
+  )
+
+# Verify the new column
+df_processed %>%
+  select(author, first_author) %>%
+  head()
+```
+
+### 3.2. Creating Numeric Columns for Analysis
+
+Many columns containing numeric data (e.g., percentages, sample sizes, rates) are currently stored as character strings. We will parse these strings to extract the numbers and convert them into a numeric format. For percentages, we will convert them to proportions (ranging from 0 to 1), which is standard practice for statistical analysis.
+
+We use `str_extract()` with a regular expression `\\d+\\.?\\d*` to find the first number (integer or decimal) in a string. The `as.numeric()` function then converts this extracted text into a number. Any text that cannot be converted (like "Not Applicable") will become `NA` (Not Available), which is the correct way to represent missing data in R.
+
+```{r create-numeric-columns}
+df_final <- df_processed %>%
+  mutate(
+    # --- Sample Sizes ---
+    n_total_sample = as.numeric(total_sample_size_n),
+    n_procedures = as.numeric(total_procedures),
+    n_ssi = as.numeric(total_ss_is), 
+    n_isolates = as.numeric(total_ssi_isolates),
+    
+    # --- Demographics ---
+    # Extract the first number, which is usually the mean or median age
+    age_central_tendency = as.numeric(str_extract(age_mean_median_sd_iqr, "\\d+\\.?\\d*")),
+    prop_female = as.numeric(str_extract(sex_percent_female, "\\d+\\.?\\d*")) / 100,
+
+    # --- Incidence and Adherence ---
+    prop_ssi_incidence = as.numeric(str_extract(ssi_incidence_rate, "\\d+\\.?\\d*")) / 100,
+    prop_adherence_guidelines = as.numeric(str_extract(adherence_to_guidelines_percent, "\\d+\\.?\\d*")) / 100,
+
+    # --- Morbidity ---
+    morbidity_add_hosp_stay_days = as.numeric(str_extract(morbidity_additional_hospital_stay_days, "\\d+\\.?\\d*")),
+    prop_reoperation_rate = as.numeric(str_extract(morbidity_re_opertation_rate_percent, "\\d+\\.?\\d*")) / 100,
+    prop_readmission_rate = as.numeric(str_extract(morbidity_readmission_rate_percent, "\\d+\\.?\\d*")) / 100,
+
+    # --- Mortality ---
+    prop_mortality_ssi_attributable = as.numeric(str_extract(mortality_ssi_attributable_rate_percent, "\\d+\\.?\\d*")) / 100,
+    prop_mortality_30day_post_op = as.numeric(str_extract(mortality_30_day_post_op, "\\d+\\.?\\d*")) / 100
+  )
+```
+
+### 3.3. Creating a Unique Study Identifier
+
+While the `first_author` column is useful, a standardized `study_id` (Surname Year) is the best practice for labeling in systematic reviews. It's short, informative, and nearly always unique. We will create this now.
+
+```{r create-study-id}
+extract_surname <- function(name) {
+  # clean and trim
+  name <- name %>% 
+    str_replace_all("\\s+", " ") %>%    # collapse multiple spaces
+    str_trim() %>%
+    str_replace_all("[,\\.]+$", "")     # remove trailing commas/periods
+  
+  parts <- str_split(name, "\\s+")[[1]]
+  n <- length(parts)
+  if (n == 0) return(NA_character_)
+  
+  # 1) If last token looks like an initial (e.g. "P" or "P."), assume it's an initial at the end:
+  if (str_detect(parts[n], "^[A-Za-z]$") || str_detect(parts[n], "^[A-Za-z]\\.$")) {
+    return(str_c(parts[1:(n-1)], collapse = " "))
+  }
+  
+  # 2) If we find a known surname prefix (De, Van, Da, etc.), return prefix + next token
+  prefixes <- c("De","de","Van","van","Von","von","Da","da","Di","di","Del","del","Der","der","St","st","Mac","mac")
+  idx <- which(parts %in% prefixes)
+  if (length(idx) > 0) {
+    i <- idx[1]
+    if (i < n) {
+      return(str_c(parts[i:(i+1)], collapse = " "))  # e.g. "De Nardo" or "Van der"
+    } else {
+      return(parts[i])
+    }
+  }
+  
+  # 3) Fallback: assume surname-first format and take the first token
+  return(parts[1])
+}
+
+df_final <- df_final %>%
+  # if you don't already have `first_author`, extract the first comma-separated author from `Author`
+  mutate(first_author = str_trim(word(author, 1, sep = fixed(",")))) %>%
+  rowwise() %>%
+  mutate(
+    author_surname = extract_surname(first_author),
+    study_id = paste(author_surname, year_of_publication, sep = " ")
+  ) %>%
+  ungroup() %>%
+  relocate(author_surname, study_id, .before = 1)
+
+# Verify the new study_id column
+df_final %>%
+  select(study_id, author, year_of_publication) %>%
+  head(10) %>%
+  knitr::kable(caption = "Newly Created `study_id` Column")
+```
+
+
+## 4. Verifying the New Numeric Columns
+
+Let's inspect some of the newly created columns alongside their originals to confirm the transformations were successful.
+
+```{r verify-columns, fig.width=10}
+# Select a few key original and new columns to compare
+verification_view <- df_final %>%
+  select(
+    first_author,
+    year_of_publication,
+    # Original vs. New
+    total_sample_size_n, n_total_sample,
+    ssi_incidence_rate, prop_ssi_incidence,
+    sex_percent_female, prop_female,
+    morbidity_re_opertation_rate_percent, prop_reoperation_rate
+  )
+
+# Print the comparison table
+knitr::kable(head(verification_view, 10), caption = "Comparison of Original and New Numeric Columns")
+
+# Get a statistical summary of a key new variable
+summary(df_final$prop_ssi_incidence)
+```
+
+We can also quickly visualize the distribution of SSI incidence rates across the studies that reported it.
+
+```{r visualize-ssi-rate, fig.width=10, fig.height=8}
+df_final %>%
+  # Filter out studies that did not report SSI incidence
+  filter(!is.na(prop_ssi_incidence)) %>%
+  
+  # Create the plot
+  # Notice 'fill = prop_ssi_incidence' is now INSIDE aes()
+  ggplot(aes(x = reorder(study_id, prop_ssi_incidence), y = prop_ssi_incidence, fill = prop_ssi_incidence)) +
+  
+  # geom_col() is now empty, as all aesthetics are in the main ggplot() call
+  geom_col() +
+  
+  # This line controls the color gradient. We'll make it go from a light to a dark blue.
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  
+  geom_text(
+    aes(label = scales::percent(prop_ssi_incidence, accuracy = 0.1)), 
+    hjust = -0.1, 
+    size = 3
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(
+    title = "Surgical Site Infection (SSI) Incidence Rate by Study",
+    subtitle = "Studies are ordered by decreasing incidence rate. Color indicates magnitude.",
+    x = "Study ID",
+    y = "SSI Incidence Rate",
+    fill = "Incidence Rate" # This renames the legend title
+  ) +
+  theme_minimal() +
+  theme(plot.margin = margin(10, 20, 10, 10))
+```
+
+## 5. Conclusion and Next Steps
+
+The data has been successfully loaded and pre-processed. We have:
+1.  Cleaned the column names for easy access.
+2.  Created a `first_author` column for clear study identification.
+3.  Generated several analysis-ready numeric columns for key metrics like sample size, SSI incidence, and morbidity/mortality rates.
+
+The resulting `df_final` data frame is now ready for more detailed exploratory data analysis, visualization, and the initial stages of meta-analysis.
+
+## 6. Save Processed Data
+
+```{r save-processed-data}
+write_csv(df_final, file = "../data/processed_data/cleaned_amr_ssi_data.csv")
+
+# You can also save it as an R-specific file, which preserves data types perfectly
+saveRDS(df_final, file = "../data/processed_data/cleaned_amr_ssi_data.rds")
+```
+
