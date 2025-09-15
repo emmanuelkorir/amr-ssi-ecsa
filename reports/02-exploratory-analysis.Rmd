@@ -1,0 +1,577 @@
+---
+title: "Data Preparation for AMR in SSI Systematic Review"
+author: "Emmanuel Korir"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+# install-if-missing helper
+install_if_missing <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  }
+}
+
+# ensure rprojroot is available
+install_if_missing(c("rprojroot"))
+
+# load libraries (safe)
+library(rprojroot)
+
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# try to find RStudio project root; if not found, fall back to current working dir
+root_dir <- tryCatch(
+  rprojroot::find_rstudio_project_file(),
+  error = function(e) {
+    message("rprojroot couldn't find an RStudio project file; using current working directory.")
+    NULL
+  }
+)
+
+if (!is.null(root_dir)) {
+  knitr::opts_knit$set(root.dir = root_dir)
+} else {
+  # optionally set to getwd() explicitly
+  knitr::opts_knit$set(root.dir = getwd())
+}
+```
+
+## Load Libraries and Data
+
+```{r load-libraries-and-data}
+
+install_if_missing <- function (packages) {
+    for (pkg in packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+  }
+}
+
+# List of packages you want
+packages <- c("tidyverse", "dplyr", "gtsummary", "meta", "stringr", "maps", "countrycode", "mapproj")
+
+# Install if missing
+install_if_missing(packages)
+
+library(tidyverse)
+library(dplyr)
+library(gtsummary) 
+library(meta)
+library(stringr)
+library(maps)
+library(countrycode)
+library(mapproj)
+
+# Load the clean data you saved in the last step
+df_final <- readRDS("../data/processed_data/cleaned_amr_ssi_data.rds")
+```
+
+### List column names
+```{r}
+glimpse(df_final)
+
+## colnames(df_final)/str(df_final) bot lists column names just as glimpse()
+```
+
+
+## 1. Study Characteristics
+
+```{r create-table-1}
+# Select the key columns you want to summarize
+table1_data <- df_final %>%
+  select(
+    `Publication Year` = year_of_publication,
+    `Country` = country_countries,
+    `Study Design` = study_design,
+    `Total Sample Size` = n_total_sample,
+    `SSI Incidence Rate (%)` = prop_ssi_incidence,
+    `Percent Female` = prop_female
+  )
+
+# Create the summary table
+table1_data %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    missing_text = "Not Reported"
+  ) %>%
+  add_overall() %>%
+  modify_caption("Table 1: Characteristics of Included Studies")
+```
+
+## 2. Burden of SSI Incidence
+
+Meta analysis
+
+```{r}
+meta_data <- df_final %>%
+  select(study_id, n_ssi, n_procedures) %>%
+  # A study needs both the number of SSIs and the total number of procedures
+  filter(!is.na(n_ssi) & !is.na(n_procedures))
+
+# Perform the meta-analysis of proportions (incidences)
+meta_prop <- metaprop(
+  event = n_ssi,
+  n = n_procedures,
+  studlab = study_id,
+  data = meta_data,
+  sm = "PFT", # Use Freeman-Tukey double arcsine transformation for proportions
+  method.tau = "REML" # A standard method for estimating heterogeneity
+)
+
+# Print the summary of the meta-analysis
+summary(meta_prop)
+
+# Create a forest plot - the classic visualization for a meta-analysis
+forest(meta_prop)
+```
+
+Subgroup analysis can be added later
+
+```{r meta-analysis-subgroup}
+meta_subgroup_data <- df_final %>%
+  select(study_id, n_ssi, n_procedures, country_countries) %>%
+  filter(!is.na(n_ssi) & !is.na(n_procedures) & !is.na(country_countries)) %>%
+  add_count(country_countries) %>%
+  filter(n > 1) 
+
+# Check if there's enough data to proceed
+if(nrow(meta_subgroup_data) > 0) {
+  # Perform the meta-analysis with subgroups
+  meta_prop_subgroup <- metaprop(
+    event = n_ssi,
+    n = n_procedures,
+    studlab = study_id,
+    data = meta_subgroup_data,
+    sm = "PFT",
+    method.tau = "REML",
+    byvar = country_countries # This creates the subgroup analysis
+  )
+
+    # Print the summary and create a forest plot
+  summary(meta_prop_subgroup)
+  forest(meta_prop_subgroup)
+} else {
+  print("Not enough recurring data for a meaningful subgroup analysis by country.")
+}
+
+### some studies are repeated, would delete them later, fix this error
+
+####narrative for the paper: The overall pooled incidence of SSIs across all studies was [X.XX%] (95% CI: Y.YY - Z.ZZ), as determined by a random-effects meta-analysis. Substantial heterogeneity was observed (I² = XX%, p < 0.001). When stratified by country, the pooled incidence was highest in [Country A] at [A.A%] and lowest in [Country B] at [B.B%] (Figure X).
+```
+#### Geographic bubble map
+
+```{r geographic-bubble-map, eval=FALSE}
+
+df_final_cleaned <- df_final %>%
+  mutate(
+    # Create a new column specifically for mapping
+    country_for_map = case_when(
+      # Rule 1: Standardize the name for DRC
+      country_countries == "Democratic Republic of Congo" ~ "Democratic Republic of the Congo",
+      
+      # Rule 2: Identify and exclude the multi-country study by setting it to NA.
+      # str_detect() finds any row containing this specific text pattern.
+      str_detect(country_countries, "Benin, Ghana, Nigeria") ~ NA_character_,
+      
+      # Rule 3: For all other countries that are fine, keep their original names.
+      TRUE ~ country_countries
+    )
+  )
+
+# Optional: You can print a message to confirm which studies were excluded from the map
+multi_country_studies <- df_final_cleaned %>%
+  filter(is.na(country_for_map)) %>%
+  select(study_id, country_countries)
+
+if(nrow(multi_country_studies) > 0){
+  message("The following studies were identified as multi-country and will be excluded from the map:")
+  print(multi_country_studies)
+}
+
+# Step 1: Summarize the CLEANED data by country
+country_summary <- df_final_cleaned %>%
+  # Filter out rows with no SSI data or the multi-country studies we set to NA
+  filter(!is.na(prop_ssi_incidence) & !is.na(country_for_map)) %>%
+  group_by(country_for_map) %>% # Use the new clean column
+  summarise(
+    mean_ssi_rate = mean(prop_ssi_incidence, na.rm = TRUE),
+    n_studies = n()
+  ) %>%
+  ungroup()
+
+# Step 2: Get world country centroids (center points)
+world_map_data <- map_data("world")
+country_centroids <- world_map_data %>%
+  group_by(region) %>%
+  summarise(long = mean(long), lat = mean(lat))
+
+# Step 3: Join your summary data with the coordinate data
+map_plot_data <- left_join(country_summary, country_centroids, by = c("country_for_map" = "region"))
+
+# --- PART 4: Create the Plot with a Dynamic Caption (The New Part) ---
+
+# First, create the text for our caption
+# This automatically counts the number of excluded studies.
+caption_text <- paste0("Note: ", nrow(multi_country_studies), " multi-country study/studies were excluded from this map.")
+
+# Now, create the plot and add the caption
+ggplot() +
+  geom_polygon(data = world_map_data, aes(x = long, y = lat, group = group), fill = "gray90", color = "white") +
+  geom_point(data = map_plot_data, aes(x = long, y = lat, size = n_studies, color = mean_ssi_rate), alpha = 0.8) +
+  scale_size_continuous(range = c(4, 15), name = "Number of Studies") +
+  scale_color_viridis_c(option = "plasma", name = "Mean SSI Rate (%)") +
+  coord_map(xlim = c(-20, 55), ylim = c(-35, 38)) +
+  
+  # This is the line that adds the text TO THE PLOT
+  labs(
+    title = "Geographic Distribution and Burden of SSIs in Africa",
+    subtitle = "Bubble size represents number of studies; color represents mean SSI incidence rate",
+    x = NULL, y = NULL,
+    caption = caption_text # ADDED THIS LINE
+  ) +
+  
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    plot.caption = element_text(hjust = 0, size = 9, face = "italic") # Style the caption
+  )
+
+```
+
+
+### Stratified SSI Incidence
+
+```{r stratified-ssi-incidence, eval=FALSE}
+# Filter for studies that report specialty and have the necessary numbers
+meta_specialty_data <- df_final %>%
+  select(study_id, n_ssi, n_procedures, surgical_speciality) %>%
+  filter(!is.na(n_ssi) & !is.na(n_procedures) & !is.na(surgical_speciality)) %>%
+  add_count(surgical_speciality) %>%
+  filter(n > 1) # Subgroup analysis requires at least 2 studies per group
+
+if(nrow(meta_specialty_data) > 0) {
+  meta_prop_specialty <- metaprop(
+    event = n_ssi,
+    n = n_procedures,
+    studlab = study_id,
+    data = meta_specialty_data,
+    sm = "PFT",
+    byvar = surgical_speciality # The only line that changes!
+  )
+  
+  forest(meta_prop_specialty)
+} else {
+  print("Not enough data for a meaningful subgroup analysis by surgical specialty.")
+}
+
+```
+
+
+## 3. Challenges
+
+### 3a. Aetiological Agents
+
+List of most common pathogens in ECSA
+
+```{r}
+# Reshape the data to make it easy to count pathogens
+pathogen_long <- df_final %>%
+  select(study_id, pathogen_1_name_name_of_the_most_common_isolated_pathogen, pathogen_2_name_name_of_the_2nd_most_common_pathogen, pathogen_3_name_name_of_the_3rd_most_common_isolated_pathogen) %>%
+  pivot_longer(
+    cols = starts_with("pathogen"),
+    names_to = "pathogen_rank",
+    values_to = "pathogen_name"
+  ) %>%
+  filter(!is.na(pathogen_name)) # Remove rows where there was no pathogen listed
+
+# Now we can easily count the most frequently reported pathogens
+pathogen_counts <- pathogen_long %>%
+  count(pathogen_name, sort = TRUE, name = "count")
+
+# Visualize the top 10 most common pathogens
+pathogen_counts %>%
+  top_n(10, count) %>%
+  ggplot(aes(x = reorder(pathogen_name, count), y = count)) +
+  geom_col(fill = "darkred") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Most Frequently Reported Pathogens in SSIs",
+    x = "Pathogen",
+    y = "Number of Times Reported (as a Top 3 Pathogen)"
+  ) +
+  theme_minimal()
+```
+
+### 3b. AMR
+
+Analysis of resistance patterns for the key pathogens
+
+```{r parse-and-analyze-resistance}
+
+# Step 1: Reshape data with explicit renaming for clarity and robustness
+# We select and rename the long original columns to a simple, predictable pattern 
+# like 'pathogen_name_1', 'resistance_1', etc.
+pathogens_long <- df_final %>%
+  select(
+    study_id,
+    pathogen_name_1 = `pathogen_1_name_name_of_the_most_common_isolated_pathogen`,
+    resistance_1 = `pathogen_1_resistance_list_antibiotic_resistance`,
+    pathogen_name_2 = `pathogen_2_name_name_of_the_2nd_most_common_pathogen`,
+    resistance_2 = `pathogen_2_resistance_list_antibiotic_resistance_percent`, # Note the slightly different name here
+    pathogen_name_3 = `pathogen_3_name_name_of_the_3rd_most_common_isolated_pathogen`,
+    resistance_3 = `pathogen_3_resistance_list_antibiotic_resistance`
+  ) %>%
+  # NOW, pivot_longer can work on our clean, simple names
+  pivot_longer(
+    cols = -study_id,
+    names_to = c(".value", "rank"), # This creates new columns from the first part of the name
+    names_pattern = "([a-z_]+)_(\\d)" # Splits "pathogen_name_1" into "pathogen_name" and "1"
+  )
+
+# At this point, pathogens_long has columns named `study_id`, `rank`, `pathogen_name`, and `resistance`.
+# The error is now fixed because the `pathogen_name` column exists.
+
+# Step 2: Parse the resistance text string for each pathogen
+# (This part of the code remains the same as it operates on the now-correctly-shaped data)
+resistance_tidy <- pathogens_long %>%
+  # Filter out rows where there is no pathogen name or no resistance data
+  filter(!is.na(pathogen_name) & !is.na(resistance) & resistance != "") %>%
+  # Rename the 'resistance' column which contains the raw text string for clarity
+  rename(resistance_data = resistance) %>%
+  # Split the comma-separated list into separate rows
+  separate_rows(resistance_data, sep = ",\\s*") %>%
+  # Extract the antibiotic name and the resistance percentage using regex
+  mutate(
+    antibiotic_name = str_trim(str_extract(resistance_data, "^[A-Za-z\\s\\-]+")),
+    resistance_rate = as.numeric(str_extract(resistance_data, "\\d+\\.?\\d*"))
+  ) %>%
+  # Clean up and keep only valid rows
+  filter(!is.na(antibiotic_name) & !is.na(resistance_rate)) %>%
+  select(study_id, pathogen_name, antibiotic_name, resistance_rate)
+
+# Step 3: Analyze and Visualize the Resistance Data
+# (This part of the code also remains the same)
+# Let's analyze resistance for the top 3 most common pathogens
+top_pathogens <- c("Staphylococcus aureus", "Escherichia coli", "Klebsiella pneumoniae")
+
+resistance_summary <- resistance_tidy %>%
+  filter(pathogen_name %in% top_pathogens) %>%
+  group_by(pathogen_name, antibiotic_name) %>%
+  summarise(
+    n_studies_reported = n(),
+    mean_resistance = mean(resistance_rate, na.rm = TRUE),
+    median_resistance = median(resistance_rate, na.rm = TRUE),
+    .groups = 'drop' # Recommended to add .groups = 'drop' after summarise
+  ) %>%
+  filter(n_studies_reported >= 2) %>% 
+  arrange(pathogen_name, desc(mean_resistance))
+
+# Print the summary table
+print(resistance_summary)
+
+# Create a faceted plot to show resistance for each top pathogen
+resistance_summary %>%
+  ggplot(aes(x = mean_resistance, y = reorder(antibiotic_name, mean_resistance), fill = pathogen_name)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(mean_resistance), "%")), hjust = -0.2, size = 3) +
+  facet_wrap(~pathogen_name, scales = "free_y") +
+  labs(
+    title = "Mean Antimicrobial Resistance Rates for Top Pathogens",
+    x = "Mean Resistance Rate (%)",
+    y = "Antibiotic"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  xlim(0, 110)
+```
+Narrative for the paper:
+The most frequently isolated pathogens were Staphylococcus aureus, Escherichia coli, and Klebsiella pneumoniae. Resistance patterns for these organisms were extracted (Table X). Staphylococcus aureus demonstrated high mean resistance to [Ampicillin] ([XX.X%]) and [Penicillin] ([YY.Y%]), but remained susceptible to [Vancomycin] ([Z.Z%]). Among Gram-negative isolates, E. coli showed alarming resistance rates to third-generation cephalosporins like [Ceftriaxone] ([AA.A%]). Figure Y visualizes the resistance profiles for the most commonly reported pathogen-antibiotic combinations.
+
+### 3c. Clinical and Economic Burden
+
+Summary of morbidity, mortality, and costs
+```{r burden-analysis}
+burden_data <- df_final %>%
+  select(
+    `Additional Hospital Stay (Days)` = morbidity_add_hosp_stay_days,
+    `Re-operation Rate (%)` = prop_reoperation_rate,
+    `Readmission Rate (%)` = prop_readmission_rate,
+    `SSI-Attributable Mortality Rate (%)` = prop_mortality_ssi_attributable
+  )
+
+# Create a summary table of these outcomes
+burden_data %>%
+  tbl_summary(
+    statistic = all_continuous() ~ "{mean} ({sd}) | {median} ({p25}, {p75})",
+    label = list(
+      `Additional Hospital Stay (Days)` ~ "Additional Hospital Stay (Mean Days)",
+      `Re-operation Rate (%)` ~ "Re-operation (Mean %)",
+      `Readmission Rate (%)` ~ "Readmission (Mean %)",
+      `SSI-Attributable Mortality Rate (%)` ~ "SSI-Attributable Mortality (Mean %)"
+    ),
+    missing_text = "Not Reported"
+  ) %>%
+  modify_caption("Table X: Clinical and Economic Burden Associated with SSIs")
+```
+Narrative: 
+"The clinical burden of SSIs was substantial. Across studies that reported it, SSIs were associated with a mean additional hospital stay of [X.X] days. The mean re-operation rate was [Y.Y%], and the mean SSI-attributable mortality was [Z.Z%] (Table X)."
+
+### 3d. WHO critical important antibiotics
+
+```{r who-amr-analysis, eval=FALSE}
+# First, run the 'parse-and-analyze-resistance' chunk to create 'resistance_tidy'
+
+# Define a list of WHO "Critically Important Antimicrobials" (this is an example list, expand as needed)
+# Source: WHO AWaRe classification
+who_critical_abx <- c(
+  # Cephalosporins (3rd gen and higher)
+  "Ceftriaxone", "Cefotaxime", "Ceftazidime", "Cefepime",
+  # Carbapenems
+  "Meropenem", "Imipenem", "Ertapenem",
+  # Glycopeptides
+  "Vancomycin",
+  # Fluoroquinolones
+  "Ciprofloxacin", "Levofloxacin"
+)
+
+# Analyze resistance specifically to these antibiotics
+who_resistance_summary <- resistance_tidy %>%
+  # Filter for only the antibiotics in our critical list
+  filter(antibiotic_name %in% who_critical_abx) %>%
+  group_by(pathogen_name, antibiotic_name) %>%
+  summarise(
+    n_studies = n(),
+    mean_resistance = mean(resistance_rate),
+    .groups = 'drop'
+  ) %>%
+  arrange(pathogen_name, desc(mean_resistance))
+
+# Print the table
+print(who_resistance_summary)
+
+# Visualize it
+who_resistance_summary %>%
+  ggplot(aes(x = mean_resistance, y = reorder(antibiotic_name, mean_resistance), fill = pathogen_name)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Resistance to WHO Critically Important Antimicrobials",
+    x = "Mean Resistance Rate (%)",
+    y = "Antibiotic",
+    fill = "Pathogen"
+  ) +
+  theme_minimal()
+```
+
+Narrative:
+Resistance to WHO Critically Important Antimicrobials was widespread. For example, the mean resistance of E. coli to Ceftriaxone was [XX.X%] across [N] studies. Alarming rates of resistance to carbapenems were noted for Pseudomonas aeruginosa (Figure Z).
+## 4. Innovation and Straegies
+
+### 4a. Reported Interventions and Innovations
+
+### 4b. Reported Drivers of AMR and Gaps
+
+```{r}
+# We will use the same text analysis technique as for the resistance data
+
+# 4a. Interventions and Innovations Described
+interventions_counts <- df_final %>%
+  select(interventions_innovations_described) %>%
+  filter(!is.na(interventions_innovations_described) & interventions_innovations_described != "") %>%
+  separate_rows(interventions_innovations_described, sep = ",\\s*|;\\s*") %>%
+  count(interventions_innovations_described, sort = TRUE, name = "number_of_studies")
+
+# 4b. Reported Drivers of AMR
+drivers_counts <- df_final %>%
+  select(reported_drivers_of_amr) %>%
+  filter(!is.na(reported_drivers_of_amr) & reported_drivers_of_amr != "") %>%
+  separate_rows(reported_drivers_of_amr, sep = ",\\s*|;\\s*") %>%
+  count(reported_drivers_of_amr, sort = TRUE, name = "number_of_studies")
+
+# 4c. Gaps Identified by Authors
+gaps_counts <- df_final %>%
+  select(gaps_identified_by_authors) %>%
+  filter(!is.na(gaps_identified_by_authors) & gaps_identified_by_authors != "") %>%
+  separate_rows(gaps_identified_by_authors, sep = ",\\s*|;\\s*") %>%
+  count(gaps_identified_by_authors, sort = TRUE, name = "number_of_studies")
+
+# Display these as tables using gtsummary or gt
+# Example for Interventions
+interventions_counts %>%
+  gt::gt() %>%
+  gt::cols_label(
+    interventions_innovations_described = "Intervention or Innovation",
+    number_of_studies = "Number of Studies Mentioning"
+  ) %>%
+  gt::tab_header("Table Y: Reported Strategies and Innovations to Combat AMR in SSIs")
+
+# Display drivers
+drivers_counts %>%
+  gt::gt() %>%
+  gt::cols_label(
+    reported_drivers_of_amr = "Reported Driver of AMR",
+    number_of_studies = "Number of Studies Mentioning"
+  ) %>%
+  gt::tab_header("Table Z: Perceived Drivers of AMR")
+```
+
+Narrative for the paper:
+Several studies described interventions aimed at combating SSIs and AMR. The most frequently mentioned strategies included [e.g., 'Enhanced hand hygiene programs'] (N=X studies), ['Implementation of antibiotic stewardship'] (N=Y studies), and ['Pre-operative screening for MRSA'] (N=Z studies) (Table Y). Authors of the included studies identified several drivers of AMR, with ['Over-the-counter antibiotic sales'] and ['Poor infection control'] being the most cited (Table Z). Key gaps identified for future research included the need for ['Robust surveillance systems'] and ['Point-of-care diagnostics'].
+
+## 5. Morbidity, Hospital Burden, and Economic Costs
+
+```{r}
+# Part A: Quantitative Burden Metrics
+# We are cleaning up the mortality column first, assuming it might have '%' signs
+burden_quantitative <- df_final %>%
+  mutate(
+    mortality_90_day = as.numeric(str_remove(`mortality_90_day_post_op_percent`, "%"))
+  ) %>%
+  select(
+    `Additional Hospital Stay (Days)` = morbidity_add_hosp_stay_days,
+    `Total Length of Stay (Days)` = hospital_burden_total_length_of_stay_days,
+    `Re-operation Rate (%)` = prop_reoperation_rate,
+    `Readmission Rate (%)` = prop_readmission_rate,
+    `SSI-Attributable Mortality Rate (%)` = prop_mortality_ssi_attributable,
+    `30-Day Post-op Mortality (%)` = prop_mortality_30day_post_op,
+    `90-Day Post-op Mortality (%)` = mortality_90_day
+  )
+
+# Create the summary table
+burden_quantitative %>%
+  tbl_summary(
+    statistic = all_continuous() ~ "{mean} ({sd})",
+    digits = all_continuous() ~ 1,
+    missing_text = "Not Reported"
+  ) %>%
+  modify_caption("Table X: Clinical Burden and Mortality Associated with SSIs")
+
+# Part B: Qualitative Economic Cost Analysis
+economic_costs <- df_final %>%
+  select(study_id, `Direct Costs` = economic_direct_costs, `Indirect Costs` = economic_indirect_costs) %>%
+  pivot_longer(cols = -study_id, names_to = "cost_type", values_to = "cost_description") %>%
+  filter(!is.na(cost_description) & cost_description != "") %>%
+  separate_rows(cost_description, sep = ",\\s*|;\\s*") %>%
+  count(cost_type, cost_description, sort = TRUE)
+
+# Display as a table
+economic_costs %>%
+  gt::gt() %>%
+  gt::tab_header("Table Y: Reported Economic Costs of SSIs")
+```
+
+
+
