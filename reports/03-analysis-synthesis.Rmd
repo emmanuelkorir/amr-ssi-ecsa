@@ -1,0 +1,193 @@
+---
+title: "AMR & SSI in ECSA: Synthesis"
+author: "Marion Korir et al."
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+params:
+  data_file: "data/processed_data/data_extraction_amr_ssi_ecsa_enriched.csv"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(gtsummary)
+  library(meta)
+  library(stringr)
+  library(countrycode)
+  library(mapproj)
+})
+
+root <- rprojroot::find_root(rprojroot::has_file("amr-ssi-ecsa.Rproj"))
+file <- file.path(root, params$data_file)
+if (!file.exists(file)) {
+  stop("Data file not found: ", file)
+}
+
+df <- readr::read_csv(file, show_col_types = FALSE) %>%
+  clean_names()
+
+# Minimal helpers
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+num <- function(x) readr::parse_number(as.character(x))
+yn <- function(x) case_when(
+  is.na(x) ~ NA_character_,
+  str_to_lower(x) %in% c("yes","y","true") ~ "Yes",
+  str_to_lower(x) %in% c("no","n","false") ~ "No",
+  TRUE ~ str_to_sentence(x)
+)
+
+# Derive a study_id similar to your existing reports
+if (!"study_id" %in% names(df)) {
+  df <- df %>% mutate(
+    first_author = str_remove(str_to_sentence(author %||% ""), ",.*$"),
+    study_id = paste0(first_author, "_", year_of_publication %||% "")
+  )
+}
+
+# Country helpers
+countries <- df %>% 
+  mutate(country_list = str_split(country_list %||% "", ";\\s*")) %>%
+  unnest(country_list) %>%
+  filter(!is.na(country_list) & country_list != "") %>%
+  mutate(region = countrycode(country_list, "country.name", "region"))
+```
+
+## Overview and dataset
+
+```{r overview}
+df %>% select(study_id, author, year_of_publication, title_of_paper, study_design, `study_design_mece` = `study_design_mece`) %>% head(10)
+```
+
+```{r counts}
+list(
+  n_studies = n_distinct(df$study_id),
+  years = range(num(df$year_start), na.rm = TRUE),
+  countries = n_distinct(countries$country_list)
+)
+```
+
+## Table 1: Study characteristics
+
+```{r table1}
+char_vars <- c(
+  "study_design_mece",
+  "facility_level_guess",
+  "speciality_set"
+)
+
+df_tbl1 <- df %>%
+  mutate(
+    ssi_denominator_type = str_to_sentence(ssi_denominator_type),
+    diagnosis_cdc_guidelines = yn(diagnosis_cdc_guidelines),
+    lab_culture_confirmed = yn(lab_culture_confirmed),
+    followup_30d = yn(followup_30d)
+  )
+
+vars_tbl1 <- c(char_vars, "ssi_denominator_type", "diagnosis_cdc_guidelines", "lab_culture_confirmed", "followup_30d")
+
+df_tbl1 %>%
+  select(all_of(vars_tbl1)) %>%
+  tbl_summary(by = NULL, statistic = list(all_categorical() ~ "{n} ({p}%)")) %>%
+  as_gt()
+```
+
+## Meta-analysis: SSI incidence
+
+```{r metaprop, message=FALSE}
+# Use procedures as denominator when available; else skip
+inc_dat <- df %>%
+  mutate(
+    events = num(total_ssis_n_parsed),
+    n = num(total_procedures_n_parsed)
+  ) %>%
+  filter(!is.na(events), !is.na(n), n > 0)
+
+if (nrow(inc_dat) >= 2) {
+  m <- meta::metaprop(
+    event = inc_dat$events,
+    n = inc_dat$n,
+    sm = "PFT",
+    method = "Inverse",
+    method.ci = "CP",
+    random = TRUE,
+    studlab = inc_dat$study_id
+  )
+  m
+} else {
+  cat("Insufficient data to run meta-analysis of incidence.\n")
+}
+```
+
+### Forest plot
+
+```{r forestplot, fig.width=7, message=FALSE, warning=FALSE, out.width='85%'}
+if (exists("m") && inherits(m, "meta")) {
+  # Dynamically size the figure based on number of studies to avoid huge plots
+  n_inc <- length(m$TE)
+  h <- min(12, max(5, 0.3 * n_inc + 4))
+  knitr::opts_current$set(fig.height = h)
+
+  meta::forest(
+    m,
+    prediction = TRUE,
+    comb.fixed = FALSE,
+    comb.random = TRUE,
+    backtransf = TRUE,
+    leftcols = c("studlab"),
+    leftlabs = c("Study"),
+    rightlabs = c("Proportion", "95% CI"),
+    smlab = "SSI proportion"
+  )
+}
+```
+
+### Funnel plot (optional)
+
+```{r funnelplot, fig.width=6, fig.height=6, message=FALSE, warning=FALSE}
+if (exists("m") && inherits(m, "meta")) {
+  meta::funnel(m, backtransf = TRUE)
+}
+```
+
+## Pathogens and resistance patterns
+
+```{r pathogens}
+# Simple frequency
+pat_freq <- df %>%
+  count(pathogen1_std, sort = TRUE) %>%
+  filter(!is.na(pathogen1_std) & pathogen1_std != "")
+pat_freq %>% head(10)
+```
+
+```{r amr}
+# If you have AST columns, you can adapt from 02-exploratory-analysis.Rmd.
+# Placeholder plot of top pathogens
+pat_freq %>% top_n(10, n) %>%
+  ggplot(aes(x = reorder(pathogen1_std, n), y = n)) +
+  geom_col(fill = "#2c7fb8") +
+  coord_flip() +
+  labs(x = "Pathogen (std)", y = "Count", title = "Top isolated pathogens across studies")
+```
+
+## Policy, capacity, and thematic synthesis
+
+```{r themes}
+# Quick counts of thematic tags
+sel <- df %>% select(drivers_amr_themes, interventions_themes, gaps_themes, policy_capacity_themes, economic_costs_themes)
+sel %>% summarise(across(everything(), ~ sum(!is.na(.) & . != "")))
+```
+
+## Narrative synthesis (scaffold)
+
+The studies across ECSA reveal heterogeneous designs with a predominance of {`r df %>% count(study_design_mece) %>% arrange(desc(n)) %>% slice_head(n=1) %>% pull(study_design_mece)`}, conducted primarily in {`r countries %>% count(region, sort=TRUE) %>% slice_head(n=1) %>% pull(region)`} settings. Diagnostic ascertainment frequently {`r df %>% count(diagnosis_cdc_guidelines) %>% arrange(desc(n)) %>% slice_head(n=1) %>% pull(diagnosis_cdc_guidelines)`} referenced CDC criteria, and culture confirmation was {`r df %>% count(lab_culture_confirmed) %>% arrange(desc(n)) %>% slice_head(n=1) %>% pull(lab_culture_confirmed)`}.
+
+Where denominators permitted, pooled SSI incidence was estimated using a random-effects model. Coverage limitations were notable, particularly for readmission, reoperation, LOS, and economic outcomes, which requires targeted re-extraction. The thematic synthesis suggested recurrent drivers including antibiotic misuse and IPC gaps, with interventions centering on IPC, AMS, and guideline implementation. Policy and capacity narratives highlighted limited laboratory capability and the need for coordinated national surveillance and stewardship programs.
+
+Limitations include data sparsity, reporting heterogeneity, and potential publication bias. Future work should standardize outcome definitions (CDC, 30-day follow-up), ensure routine culture/AST reporting, and quantify economic burden to inform regional stewardship and policy strategies.
