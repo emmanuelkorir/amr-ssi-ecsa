@@ -1,0 +1,518 @@
+---
+title: "AMR & SSI in ECSA: Synthesis (Enhanced Visualizations)"
+author: "Marion Korir et al."
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+params:
+  data_file: "data/processed_data/data_extraction_amr_ssi_ecsa_enriched.csv"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# --- Package Management ---
+# This chunk checks for missing packages and installs them if necessary.
+required_packages <- c(
+  "tidyverse", "janitor", "gtsummary", "meta", "stringr", 
+  "countrycode", "mapproj", "viridis", "patchwork", "rprojroot", "knitr", "scales"
+)
+missing_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+# Load required packages
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(gtsummary)
+  library(meta)
+  library(stringr)
+  library(countrycode)
+  library(mapproj)
+  library(viridis) # For better color scales
+  library(patchwork) # For combining plots
+})
+
+# Set a consistent, clean theme for all ggplot visualizations
+theme_set(theme_light() + theme(
+  plot.title = element_text(face = "bold", size = 14),
+  plot.subtitle = element_text(size = 11, color = "gray30"),
+  plot.caption = element_text(color = "gray50"),
+  strip.text = element_text(face = "bold")
+))
+
+# --- Data Loading and Cleaning ---
+# Find the project root to create a robust file path
+root <- rprojroot::find_root(rprojroot::has_file("amr-ssi-ecsa.Rproj"))
+file <- file.path(root, params$data_file)
+if (!file.exists(file)) {
+  stop("Data file not found: ", file)
+}
+
+# Read and clean the data
+df <- readr::read_csv(file, show_col_types = FALSE) %>%
+  clean_names()
+
+# Minimal helper functions
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
+num <- function(x) readr::parse_number(as.character(x))
+yn <- function(x) case_when(
+  is.na(x) ~ NA_character_,
+  str_to_lower(x) %in% c("yes","y","true") ~ "Yes",
+  str_to_lower(x) %in% c("no","n","false") ~ "No",
+  TRUE ~ str_to_sentence(x)
+)
+
+# Derive a study_id if it doesn't exist
+if (!"study_id" %in% names(df)) {
+  df <- df %>% mutate(
+    first_author = str_remove(str_to_sentence(author %||% ""), ",.*$"),
+    study_id = paste0(first_author, "_", year_of_publication %||% "")
+  )
+}
+
+# Process country data for mapping and analysis
+countries_long <- df %>%
+  mutate(country_list = str_split(country_list %||% "", ";\\s*")) %>%
+  unnest(country_list) %>%
+  filter(!is.na(country_list) & country_list != "") %>%
+  mutate(region = countrycode(country_list, "country.name", "region"))
+
+country_counts <- countries_long %>%
+  count(country_list, name = "n_studies") %>%
+  rename(country = country_list)
+```
+
+## Overview and Dataset
+
+This section provides a high-level summary of the included studies, their geographic distribution, and publication timeline.
+
+```{r overview}
+df %>% 
+  select(study_id, author, year_of_publication, title_of_paper, study_design_mece) %>% 
+  head(10) %>% 
+  knitr::kable(caption = "Sample of included studies")
+```
+
+```{r counts}
+list(
+  `Number of unique studies` = n_distinct(df$study_id),
+  `Publication year range` = paste(range(num(df$year_of_publication), na.rm = TRUE), collapse = " - "),
+  `Number of unique countries` = n_distinct(countries_long$country_list)
+) %>%
+  as.data.frame() %>%
+  t() %>%
+  knitr::kable(col.names = c("Value"))
+```
+
+### Geographic Distribution of Studies
+
+This map shows the number of included studies per country, helping to quickly identify geographic clusters and gaps in the evidence base.
+
+```{r map_plot, fig.width=10, fig.height=8}
+world_map <- map_data("world")
+
+# Filter for Africa to focus the map
+african_countries <- countrycode::codelist %>%
+  filter(continent == "Africa") %>%
+  pull(country.name.en)
+
+africa_map <- world_map %>%
+  filter(region %in% african_countries)
+
+# Join study counts with map data
+map_data_joined <- africa_map %>%
+  left_join(country_counts, by = c("region" = "country"))
+
+# Plot the map
+ggplot(map_data_joined, aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = n_studies), color = "white", size = 0.2) +
+  coord_map("mercator") +
+  scale_fill_viridis_c(
+    name = "Number of Studies",
+    na.value = "grey90",
+    option = "plasma",
+    direction = -1,
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+  labs(
+    title = "Geographic Distribution of Included Studies",
+    subtitle = "Studies conducted across the ECSA region",
+    caption = "Countries with no studies are shown in grey."
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+```
+
+### Timeline of Study Publication
+
+This plot shows the number of studies published each year, illustrating trends in research activity over time.
+
+```{r timeline_plot, fig.width=9, fig.height=5}
+df %>%
+  mutate(year_of_publication = num(year_of_publication)) %>%
+  filter(!is.na(year_of_publication)) %>%
+  count(year_of_publication) %>%
+  ggplot(aes(x = year_of_publication, y = n)) +
+  geom_col(fill = "#0072B2", alpha = 0.8) +
+  geom_text(aes(label = n), vjust = -0.5, size = 3) +
+  labs(
+    title = "Number of Included Studies by Publication Year",
+    x = "Year of Publication",
+    y = "Number of Studies"
+  ) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) # Ensure bars start at 0
+```
+
+
+## Study Characteristics
+
+### Table 1: Summary of Study Characteristics
+
+```{r table1}
+char_vars <- c(
+  "study_design_mece",
+  "facility_level_guess",
+  "speciality_set"
+)
+
+df_tbl1 <- df %>%
+  mutate(
+    ssi_denominator_type = str_to_sentence(ssi_denominator_type),
+    diagnosis_cdc_guidelines = yn(diagnosis_cdc_guidelines),
+    lab_culture_confirmed = yn(lab_culture_confirmed),
+    followup_30d = yn(followup_30d)
+  )
+
+vars_tbl1 <- c(char_vars, "ssi_denominator_type", "diagnosis_cdc_guidelines", "lab_culture_confirmed", "followup_30d")
+
+df_tbl1 %>%
+  select(all_of(vars_tbl1)) %>%
+  tbl_summary(
+    by = NULL,
+    statistic = list(all_categorical() ~ "{n} ({p}%)"),
+    label = list(
+      study_design_mece ~ "Study Design",
+      facility_level_guess ~ "Facility Level",
+      speciality_set ~ "Surgical Speciality",
+      ssi_denominator_type ~ "SSI Denominator Type",
+      diagnosis_cdc_guidelines ~ "Used CDC Guidelines for Diagnosis",
+      lab_culture_confirmed ~ "Lab Culture Confirmed",
+      followup_30d ~ "Follow-up at least 30 days"
+    )
+  ) %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  as_gt()
+```
+
+### Visual Summary of Study Characteristics
+
+This plot provides a visual alternative to Table 1, making it easier to compare the distribution of key study features.
+
+```{r characteristics_plot, fig.width=10, fig.height=8}
+df_tbl1 %>%
+  select(all_of(vars_tbl1)) %>%
+  pivot_longer(everything(), names_to = "characteristic", values_to = "value") %>%
+  filter(!is.na(value) & value != "") %>%
+  mutate(
+    characteristic = case_when(
+      characteristic == "study_design_mece" ~ "Study Design",
+      characteristic == "facility_level_guess" ~ "Facility Level",
+      characteristic == "speciality_set" ~ "Surgical Speciality",
+      characteristic == "ssi_denominator_type" ~ "SSI Denominator",
+      characteristic == "diagnosis_cdc_guidelines" ~ "Used CDC Guidelines",
+      characteristic == "lab_culture_confirmed" ~ "Lab Confirmed",
+      characteristic == "followup_30d" ~ ">=30-day Follow-up",
+      TRUE ~ characteristic
+    )
+  ) %>%
+  count(characteristic, value) %>%
+  ggplot(aes(x = n, y = fct_reorder(value, n))) +
+  geom_col(aes(fill = characteristic), show.legend = FALSE) +
+  geom_text(aes(label = n), hjust = -0.2, size = 3.5) +
+  facet_wrap(~characteristic, scales = "free", ncol = 2) +
+  labs(
+    title = "Distribution of Key Study Characteristics",
+    subtitle = "Counts of categories across all included studies",
+    x = "Number of Studies",
+    y = ""
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) + # Add space for text labels
+  theme(strip.text = element_text(face = "bold", size = 11))
+```
+
+
+## Meta-analysis: SSI Incidence
+
+```{r metaprop, message=FALSE}
+# Prepare data for meta-analysis
+inc_dat <- df %>%
+  mutate(
+    events = num(total_ssis_n_parsed),
+    n = num(total_procedures_n_parsed)
+  ) %>%
+  filter(!is.na(events), !is.na(n), n > 0)
+
+# Run meta-analysis if there are at least 2 studies with required data
+if (nrow(inc_dat) >= 2) {
+  m <- meta::metaprop(
+    event = inc_dat$events,
+    n = inc_dat$n,
+    sm = "PFT",
+    method = "Inverse",
+    method.ci = "CP",
+    random = TRUE,
+    studlab = inc_dat$study_id
+  )
+  m # Print the summary of the meta-analysis
+} else {
+  cat("Insufficient data to run meta-analysis of incidence.\n")
+}
+```
+
+### Forest Plot (ggplot2 Version)
+
+This forest plot, created with `ggplot2`, offers a modern and clear visualization of the SSI incidence from each study and the pooled estimate. The diamond represents the overall random-effects model estimate.
+
+```{r forestplot_ggplot, fig.width=10, out.width='100%'}
+if (exists("m") && inherits(m, "meta")) {
+  # Extract data from the meta object
+  meta_df <- tibble(
+    study = m$studlab,
+    proportion = m$TE,
+    lower = m$lower,
+    upper = m$upper,
+    weight = m$w.random / sum(m$w.random) * 100
+  )
+
+  # Add the summary estimate
+  summary_df <- tibble(
+    study = "Random effects model",
+    proportion = m$TE.random,
+    lower = m$lower.random,
+    upper = m$upper.random,
+    weight = 100
+  )
+
+  # Combine and format for plotting
+  plot_df <- bind_rows(meta_df, summary_df) %>%
+    mutate(
+      study = fct_relevel(study, "Random effects model", after = 0),
+      label = sprintf("%.1f%% [%.1f%%, %.1f%%]", proportion * 100, lower * 100, upper * 100),
+      is_summary = (study == "Random effects model")
+    )
+
+  # Dynamically set figure height based on the number of studies
+  h <- min(12, max(5, 0.3 * nrow(plot_df) + 2))
+  knitr::opts_current$set(fig.height = h)
+
+  # Create the plot
+  ggplot(plot_df, aes(x = proportion, y = study)) +
+    # Add points and confidence intervals for individual studies
+    geom_pointrange(
+      data = . %>% filter(!is_summary),
+      aes(xmin = lower, xmax = upper, size = weight),
+      shape = 15 # Square shape
+    ) +
+    # Add diamond for summary estimate
+    geom_point(
+      data = . %>% filter(is_summary),
+      aes(x = proportion),
+      shape = 23, fill = "black", size = 5
+    ) +
+    geom_linerange(
+      data = . %>% filter(is_summary),
+      aes(xmin = lower, xmax = upper),
+      size = 1
+    ) +
+    # Add vertical line for the pooled estimate
+    geom_vline(xintercept = m$TE.random, linetype = "dashed", color = "grey40") +
+    # Add text labels for estimates and CIs
+    geom_text(aes(label = label, x = 1.05), hjust = 0, size = 3.5) +
+    # Scales and labs
+    scale_x_continuous(
+      labels = scales::percent,
+      limits = c(0, 1.2), # Extend x-axis to make space for labels
+      breaks = seq(0, 1, by = 0.2)
+    ) +
+    scale_size_continuous(name = "Weight (%)", range = c(0.5, 2.5)) +
+    labs(
+      title = "Forest Plot of SSI Incidence",
+      subtitle = paste0("Pooled incidence: ", sprintf("%.1f%% (95%% CI: %.1f%%-%.1f%%)", m$TE.random*100, m$lower.random*100, m$upper.random*100)),
+      x = "SSI Proportion",
+      y = ""
+    ) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.text.y = element_text(hjust = 0),
+      legend.position = "bottom"
+    )
+}
+```
+
+### Funnel Plot
+
+A funnel plot can be used to assess potential publication bias.
+
+```{r funnelplot, fig.width=6, fig.height=6}
+if (exists("m") && inherits(m, "meta")) {
+  meta::funnel(m, backtransf = TRUE, col = "#0072B2", pch = 19)
+}
+```
+
+## Pathogens and Resistance Patterns
+
+### Top Isolated Pathogens
+
+This plot shows the frequency of the top 10 pathogens isolated from SSIs across all studies.
+
+```{r pathogens_plot, fig.width=9, fig.height=6}
+pat_freq <- df %>%
+  count(pathogen1_std, sort = TRUE) %>%
+  filter(!is.na(pathogen1_std) & pathogen1_std != "" & pathogen1_std != "No growth")
+
+pat_freq %>%
+  top_n(10, n) %>%
+  ggplot(aes(x = n, y = fct_reorder(pathogen1_std, n))) +
+  geom_col(fill = "#2c7fb8", alpha = 0.9) +
+  geom_text(aes(label = n), hjust = -0.2, size = 3.5) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Top 10 Most Frequently Isolated Pathogens",
+    subtitle = "Counts aggregated across all included studies",
+    x = "Number of Times Isolated",
+    y = "Pathogen"
+  )
+```
+
+### Antimicrobial Resistance Patterns (Heatmap Template)
+
+**Note:** This visualization requires your data to be in a "tidy" or "long" format. A heatmap is an excellent way to show resistance rates of key pathogens to various antibiotics.
+
+**Action Required:** You will need to prepare your AMR data. An ideal format would have columns like `study_id`, `pathogen_name`, `antibiotic_tested`, and `result` (e.g., 'R' for resistant, 'S' for susceptible).
+
+```{r amr_heatmap_plot, fig.width=10, fig.height=8}
+# --- Create Dummy AMR Data (REPLACE THIS WITH YOUR ACTUAL DATA) ---
+# This code simulates what your AMR data might look like.
+# You should prepare your real data in this 'long' format.
+set.seed(42)
+top_pathogens <- pat_freq$pathogen1_std[1:5]
+antibiotics <- c("Ciprofloxacin", "Ceftriaxone", "Gentamicin", "Meropenem", "Ampicillin", "Tetracycline", "Co-trimoxazole")
+amr_dummy_data <- expand_grid(pathogen = top_pathogens, antibiotic = antibiotics) %>%
+  mutate(
+    n_isolates = sample(20:100, n(), replace = TRUE),
+    n_resistant = rbinom(n(), n_isolates, prob = runif(n(), 0.1, 0.9)),
+    resistance_rate = n_resistant / n_isolates
+  )
+# --- End of Dummy Data Creation ---
+
+# Your actual data wrangling might look something like this:
+# amr_data_long <- your_raw_amr_data %>%
+#   ... (pivot and clean to get pathogen, antibiotic, and result columns) %>% ...
+#   group_by(pathogen, antibiotic) %>%
+#   summarise(
+#     n_isolates = n(),
+#     n_resistant = sum(result == "R", na.rm = TRUE),
+#     resistance_rate = n_resistant / n_isolates,
+#     .groups = 'drop'
+#   )
+
+# Plot the heatmap using the processed data
+ggplot(amr_dummy_data, aes(x = antibiotic, y = pathogen, fill = resistance_rate)) +
+  geom_tile(color = "white", lwd = 1.5) +
+  geom_text(aes(label = scales::percent(resistance_rate, accuracy = 1)),
+            color = "white", size = 3.5) +
+  scale_fill_viridis_c(
+    name = "Resistance Rate",
+    labels = scales::percent,
+    option = "magma",
+    direction = -1
+  ) +
+  labs(
+    title = "Antimicrobial Resistance Rates by Pathogen and Antibiotic",
+    subtitle = "Percentage of isolates found to be resistant",
+    x = "Antibiotic",
+    y = "Pathogen"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.title.position = "plot",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Thematic Synthesis
+
+### Frequency of Thematic Codes
+
+This plot summarizes the frequency of themes identified across studies, categorized by their domain (e.g., Drivers of AMR, Interventions). This provides a quick overview of the key topics discussed in the literature.
+
+```{r themes_plot, fig.width=10, fig.height=9}
+theme_cols <- c("drivers_amr_themes", "interventions_themes", "gaps_themes", "policy_capacity_themes", "economic_costs_themes")
+
+themes_long <- df %>%
+  select(study_id, all_of(theme_cols)) %>%
+  pivot_longer(
+    cols = -study_id,
+    names_to = "theme_category",
+    values_to = "themes"
+  ) %>%
+  filter(!is.na(themes) & themes != "") %>%
+  # Split semi-colon separated themes into separate rows
+  separate_rows(themes, sep = ";\\s*") %>%
+  mutate(
+    themes = str_trim(str_to_sentence(themes)),
+    theme_category = str_to_sentence(str_replace_all(theme_category, "_themes", "")) %>% str_replace_all("_", " ")
+  )
+
+themes_long %>%
+  count(theme_category, themes, name = "count") %>%
+  filter(!is.na(themes)) %>%
+  ggplot(aes(x = count, y = fct_reorder(themes, count))) +
+  geom_col(aes(fill = theme_category), show.legend = FALSE) +
+  geom_text(aes(label = count), hjust = -0.2, size = 3) +
+  facet_wrap(~theme_category, scales = "free", ncol = 2) +
+  labs(
+    title = "Frequency of Identified Thematic Codes",
+    subtitle = "Themes extracted from qualitative synthesis of included studies",
+    x = "Frequency Count",
+    y = ""
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+## Narrative Synthesis
+
+```{r narrative_synthesis_values}
+# Prepare values to be used inline in the text
+predominant_design <- df %>% count(study_design_mece, sort = TRUE) %>% slice_head(n=1) %>% pull(study_design_mece)
+predominant_region <- countries_long %>% count(region, sort = TRUE) %>% slice_head(n=1) %>% pull(region)
+cdc_guidelines_mode <- df_tbl1 %>% count(diagnosis_cdc_guidelines, sort = TRUE) %>% slice_head(n=1) %>% pull(diagnosis_cdc_guidelines)
+culture_confirmed_mode <- df_tbl1 %>% count(lab_culture_confirmed, sort = TRUE) %>% slice_head(n=1) %>% pull(lab_culture_confirmed)
+pooled_ssi_text <- if (exists("m")) {
+  sprintf("%.1f%% (95%% CI: %.1f%%-%.1f%%)", m$TE.random*100, m$lower.random*100, m$upper.random*100)
+} else {
+  "not estimated due to insufficient data"
+}
+```
+
+The studies across ECSA reveal heterogeneous designs with a predominance of **`r predominant_design`** studies, conducted primarily in **`r predominant_region`** settings. Diagnostic ascertainment **`r ifelse(cdc_guidelines_mode == 'Yes', 'frequently', 'infrequently')`** referenced CDC criteria, and culture confirmation was **`r ifelse(culture_confirmed_mode == 'Yes', 'common', 'uncommon')`**.
+
+Where denominators permitted, the pooled SSI incidence was estimated at **`r pooled_ssi_text`** using a random-effects model. The thematic synthesis suggested recurrent drivers including antibiotic misuse and IPC gaps, with interventions centering on IPC, AMS, and guideline implementation. Policy and capacity narratives highlighted limited laboratory capability and the need for coordinated national surveillance and stewardship programs.
+
+Limitations include data sparsity, reporting heterogeneity, and potential publication bias. Future work should standardize outcome definitions (CDC, 30-day follow-up), ensure routine culture/AST reporting, and quantify economic burden to inform regional stewardship and policy strategies.
